@@ -1,6 +1,9 @@
 import chromadb
+import json
+import re
 from sentence_transformers import SentenceTransformer
-from typing import List, Tuple, Optional
+from rank_bm25 import BM25Okapi
+from typing import List, Tuple, Optional, Dict
 import os
 
 from app.models import Coffee, CoffeeDocument, Ingredient
@@ -14,7 +17,14 @@ import time
 
 
 class ChromaStore:
-    """Chroma vector store wrapper with sentence-transformers embeddings."""
+    """Chroma vector store wrapper with hybrid search (semantic + field-weighted BM25)."""
+
+    # Field weights for BM25 scoring (tune these for your use case)
+    BM25_FIELD_WEIGHTS = {
+        "name": 3.0,        # Highest: user searching for specific product
+        "ingredients": 2.0, # High: ingredient searches are common
+        "content": 1.0      # Base: general description matches
+    }
 
     def __init__(self):
         self.persist_dir = settings.chroma_persist_dir
@@ -23,6 +33,17 @@ class ChromaStore:
         self._client: Optional[chromadb.PersistentClient] = None
         self._collection = None
         self._embedding_model: Optional[SentenceTransformer] = None
+
+        # Separate BM25 indexes per field for weighted scoring
+        self._bm25_name: Optional[BM25Okapi] = None
+        self._bm25_ingredients: Optional[BM25Okapi] = None
+        self._bm25_content: Optional[BM25Okapi] = None
+        self._bm25_doc_ids: List[str] = []  # Map BM25 index position to doc ID
+
+        # Store tokenized corpora for debugging/tracing
+        self._corpus_name: List[List[str]] = []
+        self._corpus_ingredients: List[List[str]] = []
+        self._corpus_content: List[List[str]] = []
 
     def initialize(self):
         """Initialize the Chroma client and embedding model."""
@@ -47,22 +68,40 @@ class ChromaStore:
 
             span.set_attribute("collection.name", self.collection_name)
 
+    def _tokenize(self, text: str) -> List[str]:
+        """Tokenize text for BM25 indexing. Lowercase and split on non-alphanumeric."""
+        return re.findall(r'\w+', text.lower())
+
+    def _build_searchable_text(self, metadata: dict, content: str) -> str:
+        """Build searchable text combining name, ingredients, and content."""
+        parts = [
+            metadata.get("name", ""),
+            metadata.get("ingredients", ""),
+            content
+        ]
+        return " ".join(parts)
+
     def _coffee_to_document(self, coffee: Coffee) -> CoffeeDocument:
-        """Convert a Coffee to a document for indexing. Ingredients come first so they
-        carry the most weight in the embedding for retrieval."""
+        """Convert a Coffee to a document for semantic embedding."""
         # Build ingredient list
-        ingredients_str = ", ".join([ing.name for ing in coffee.ingredients]) if coffee.ingredients else "N/A"
+        ingredients_str = ", ".join([ing.name for ing in coffee.ingredients]) if coffee.ingredients else ""
 
-        # Build document content: ingredients first (and repeated) for maximum retrieval weight
-        content = f"""Ingredients: {ingredients_str}
-Contains: {ingredients_str}
+        # Build natural content for embedding - no labels, no N/A, no price
+        parts = [f"{coffee.name}: {coffee.teaser}"]
 
-Name: {coffee.name}
-Description: {coffee.description}
-Teaser: {coffee.teaser}
-Origin: {coffee.origin or 'N/A'}
-Collection: {coffee.collection or 'N/A'}
-Price: ${coffee.price / 100:.2f}"""
+        if coffee.description:
+            parts.append(coffee.description)
+
+        if ingredients_str:
+            parts.append(f"Made with {ingredients_str}.")
+
+        if coffee.origin:
+            parts.append(f"Origin: {coffee.origin}.")
+
+        if coffee.collection:
+            parts.append(f"Part of the {coffee.collection} collection.")
+
+        content = " ".join(parts)
 
         return CoffeeDocument(
             id=str(coffee.id),
@@ -111,20 +150,126 @@ Price: ${coffee.price / 100:.2f}"""
 
             # PersistentClient auto-persists, no need to call persist()
 
+            # Build separate BM25 indexes for field-weighted scoring
+            with tracer.start_as_current_span("chroma.build_bm25_indexes") as bm25_span:
+                self._bm25_doc_ids = [doc.id for doc in documents]
+
+                # Build separate corpora for each field
+                self._corpus_name = []
+                self._corpus_ingredients = []
+                self._corpus_content = []
+
+                for doc in documents:
+                    self._corpus_name.append(self._tokenize(doc.metadata.get("name", "")))
+                    self._corpus_ingredients.append(self._tokenize(doc.metadata.get("ingredients", "")))
+                    self._corpus_content.append(self._tokenize(doc.content))
+
+                # Create BM25 index for each field
+                self._bm25_name = BM25Okapi(self._corpus_name) if any(self._corpus_name) else None
+                self._bm25_ingredients = BM25Okapi(self._corpus_ingredients) if any(self._corpus_ingredients) else None
+                self._bm25_content = BM25Okapi(self._corpus_content) if any(self._corpus_content) else None
+
+                bm25_span.set_attribute("bm25.documents_indexed", len(self._bm25_doc_ids))
+                bm25_span.set_attribute("bm25.field_weights", json.dumps(self.BM25_FIELD_WEIGHTS))
+                bm25_span.set_attribute("bm25.avg_name_tokens",
+                    sum(len(doc) for doc in self._corpus_name) / len(self._corpus_name) if self._corpus_name else 0)
+                bm25_span.set_attribute("bm25.avg_ingredient_tokens",
+                    sum(len(doc) for doc in self._corpus_ingredients) / len(self._corpus_ingredients) if self._corpus_ingredients else 0)
+                bm25_span.set_attribute("bm25.avg_content_tokens",
+                    sum(len(doc) for doc in self._corpus_content) / len(self._corpus_content) if self._corpus_content else 0)
+
             # Update metrics
             vectorstore_documents_total.set(len(documents))
 
             span.set_attribute("documents.indexed", len(documents))
             return len(documents)
 
+    def _bm25_score(self, query: str, doc_id: str) -> Tuple[float, Dict[str, any], float]:
+        """Calculate field-weighted BM25 score for a document.
+
+        Returns (normalized_score 0-1, field_details dict, raw_weighted_score).
+        """
+        if doc_id not in self._bm25_doc_ids:
+            return 0.0, {}, 0.0
+
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return 0.0, {}, 0.0
+
+        doc_index = self._bm25_doc_ids.index(doc_id)
+
+        # Score each field separately
+        field_scores = {}
+        field_matches = {}
+        weighted_raw_score = 0.0
+
+        # Name field
+        if self._bm25_name:
+            name_scores = self._bm25_name.get_scores(query_tokens)
+            name_raw = name_scores[doc_index]
+            name_matches = [t for t in query_tokens if t in set(self._corpus_name[doc_index])]
+            field_scores["name"] = {"raw": name_raw, "weight": self.BM25_FIELD_WEIGHTS["name"]}
+            field_matches["name"] = name_matches
+            weighted_raw_score += name_raw * self.BM25_FIELD_WEIGHTS["name"]
+
+        # Ingredients field
+        if self._bm25_ingredients:
+            ing_scores = self._bm25_ingredients.get_scores(query_tokens)
+            ing_raw = ing_scores[doc_index]
+            ing_matches = [t for t in query_tokens if t in set(self._corpus_ingredients[doc_index])]
+            field_scores["ingredients"] = {"raw": ing_raw, "weight": self.BM25_FIELD_WEIGHTS["ingredients"]}
+            field_matches["ingredients"] = ing_matches
+            weighted_raw_score += ing_raw * self.BM25_FIELD_WEIGHTS["ingredients"]
+
+        # Content field
+        if self._bm25_content:
+            content_scores = self._bm25_content.get_scores(query_tokens)
+            content_raw = content_scores[doc_index]
+            content_matches = [t for t in query_tokens if t in set(self._corpus_content[doc_index])]
+            field_scores["content"] = {"raw": content_raw, "weight": self.BM25_FIELD_WEIGHTS["content"]}
+            field_matches["content"] = content_matches
+            weighted_raw_score += content_raw * self.BM25_FIELD_WEIGHTS["content"]
+
+        # Calculate max possible weighted score across all docs for normalization
+        max_weighted = 0.0
+        for i in range(len(self._bm25_doc_ids)):
+            doc_weighted = 0.0
+            if self._bm25_name:
+                doc_weighted += self._bm25_name.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["name"]
+            if self._bm25_ingredients:
+                doc_weighted += self._bm25_ingredients.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["ingredients"]
+            if self._bm25_content:
+                doc_weighted += self._bm25_content.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["content"]
+            max_weighted = max(max_weighted, doc_weighted)
+
+        normalized_score = weighted_raw_score / max_weighted if max_weighted > 0 else 0.0
+
+        # Build detailed field info for tracing (ensure native Python types for JSON serialization)
+        field_details = {
+            "field_scores": {
+                k: {"raw": float(round(v["raw"], 4)), "weighted": float(round(v["raw"] * v["weight"], 4))}
+                for k, v in field_scores.items()
+            },
+            "field_matches": field_matches,
+            "all_matched_terms": list(set(
+                field_matches.get("name", []) +
+                field_matches.get("ingredients", []) +
+                field_matches.get("content", [])
+            ))
+        }
+
+        return float(normalized_score), field_details, float(weighted_raw_score)
+
     def search(
         self,
         query: str,
         top_k: int = None,
-        threshold: float = None
+        threshold: float = None,
+        semantic_weight: float = 0.6,
+        keyword_weight: float = 0.4
     ) -> List[Tuple[Coffee, float]]:
-        """Search for similar coffees based on query."""
-        with tracer.start_as_current_span("chroma.search") as span:
+        """Hybrid search combining semantic and keyword matching."""
+        with tracer.start_as_current_span("chroma.hybrid_search") as span:
             start_time = time.time()
 
             top_k = top_k or settings.retrieval_top_k
@@ -133,56 +278,126 @@ Price: ${coffee.price / 100:.2f}"""
             span.set_attribute("query", query)
             span.set_attribute("top_k", top_k)
             span.set_attribute("threshold", threshold)
+            span.set_attribute("semantic_weight", semantic_weight)
+            span.set_attribute("keyword_weight", keyword_weight)
 
-            # Generate query embedding
-            query_embedding = self._embedding_model.encode([query]).tolist()
+            # Step 1: Semantic search
+            with tracer.start_as_current_span("chroma.semantic_search") as semantic_span:
+                query_embedding = self._embedding_model.encode([query]).tolist()
 
-            # Search
-            results = self._collection.query(
-                query_embeddings=query_embedding,
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"]
-            )
+                # Get more results than top_k to allow reranking
+                results = self._collection.query(
+                    query_embeddings=query_embedding,
+                    n_results=min(top_k * 2, self.get_document_count() or top_k),
+                    include=["documents", "metadatas", "distances"]
+                )
+                semantic_span.set_attribute("candidates_retrieved", len(results["ids"][0]) if results["ids"] else 0)
+
+            # Step 2: Calculate hybrid scores with field-weighted BM25
+            all_candidates = []
+
+            with tracer.start_as_current_span("chroma.bm25_scoring") as bm25_span:
+                bm25_span.set_attribute("bm25.query_tokens", " ".join(self._tokenize(query)))
+                bm25_span.set_attribute("bm25.field_weights", json.dumps(self.BM25_FIELD_WEIGHTS))
+
+                if results["ids"] and results["ids"][0]:
+                    for i, doc_id in enumerate(results["ids"][0]):
+                        metadata = results["metadatas"][0][i]
+
+                        # Semantic score (convert distance to similarity)
+                        distance = results["distances"][0][i]
+                        semantic_score = 1 - distance
+
+                        # Field-weighted BM25 score
+                        bm25_normalized, field_details, bm25_raw = self._bm25_score(query, doc_id)
+
+                        # Combined hybrid score
+                        hybrid_score = (semantic_score * semantic_weight) + (bm25_normalized * keyword_weight)
+
+                        all_candidates.append({
+                            "doc_id": doc_id,
+                            "metadata": metadata,
+                            "name": metadata["name"],
+                            "semantic_score": float(round(semantic_score, 4)),
+                            "bm25_score": float(round(bm25_normalized, 4)),
+                            "bm25_raw": float(round(bm25_raw, 4)),
+                            "field_scores": field_details.get("field_scores", {}),
+                            "field_matches": field_details.get("field_matches", {}),
+                            "matched_terms": field_details.get("all_matched_terms", []),
+                            "hybrid_score": float(round(hybrid_score, 4)),
+                            "passed_threshold": bool(hybrid_score >= threshold)
+                        })
+
+            # Step 3: Sort by hybrid score and apply threshold
+            all_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
+
+            # Detailed tracing
+            span.set_attribute("candidates.count", len(all_candidates))
+            if all_candidates:
+                span.set_attribute("candidates.details", json.dumps([
+                    {k: v for k, v in c.items() if k != "metadata"}
+                    for c in all_candidates
+                ]))
+
+                # Summary stats
+                span.set_attribute("score.semantic_best", max(c["semantic_score"] for c in all_candidates))
+                span.set_attribute("score.bm25_best", max(c["bm25_score"] for c in all_candidates))
+                span.set_attribute("score.bm25_raw_best", max(c["bm25_raw"] for c in all_candidates))
+                span.set_attribute("score.hybrid_best", max(c["hybrid_score"] for c in all_candidates))
+
+                # Field-level match summary
+                name_matches = set()
+                ingredient_matches = set()
+                content_matches = set()
+                for c in all_candidates:
+                    name_matches.update(c["field_matches"].get("name", []))
+                    ingredient_matches.update(c["field_matches"].get("ingredients", []))
+                    content_matches.update(c["field_matches"].get("content", []))
+
+                span.set_attribute("bm25.name_matches", ", ".join(name_matches) if name_matches else "none")
+                span.set_attribute("bm25.ingredient_matches", ", ".join(ingredient_matches) if ingredient_matches else "none")
+                span.set_attribute("bm25.content_matches", ", ".join(content_matches) if content_matches else "none")
+
+            # Step 4: Build final results
+            coffees_with_scores = []
+
+            for candidate in all_candidates[:top_k]:
+                if candidate["hybrid_score"] >= threshold:
+                    metadata = candidate["metadata"]
+                    ingredients_str = metadata.get("ingredients") or ""
+
+                    if ingredients_str and ingredients_str != "N/A":
+                        ingredients = [
+                            Ingredient(id=idx, name=part.strip())
+                            for idx, part in enumerate(ingredients_str.split(","))
+                            if part.strip()
+                        ]
+                    else:
+                        ingredients = []
+
+                    coffee = Coffee(
+                        id=metadata["coffee_id"],
+                        name=metadata["name"],
+                        teaser=metadata["teaser"],
+                        description=metadata["description"],
+                        price=metadata["price"],
+                        image=metadata["image"],
+                        origin=metadata.get("origin") or None,
+                        collection=metadata.get("collection") or None,
+                        ingredients=ingredients,
+                    )
+                    coffees_with_scores.append((coffee, candidate["hybrid_score"]))
 
             duration = time.time() - start_time
             rag_retrieval_duration_seconds.observe(duration)
 
-            # Convert results to Coffee objects with scores
-            coffees_with_scores = []
-
-            if results["ids"] and results["ids"][0]:
-                for i, doc_id in enumerate(results["ids"][0]):
-                    metadata = results["metadatas"][0][i]
-                    # Chroma returns distances, convert to similarity (1 - distance for cosine)
-                    distance = results["distances"][0][i]
-                    similarity = 1 - distance
-
-                    # Apply threshold filter
-                    if similarity >= threshold:
-                        ingredients_str = metadata.get("ingredients") or ""
-                        if ingredients_str and ingredients_str != "N/A":
-                            ingredients = [
-                                Ingredient(id=idx, name=part.strip())
-                                for idx, part in enumerate(ingredients_str.split(","))
-                                if part.strip()
-                            ]
-                        else:
-                            ingredients = []
-
-                        coffee = Coffee(
-                            id=metadata["coffee_id"],
-                            name=metadata["name"],
-                            teaser=metadata["teaser"],
-                            description=metadata["description"],
-                            price=metadata["price"],
-                            image=metadata["image"],
-                            origin=metadata.get("origin") or None,
-                            collection=metadata.get("collection") or None,
-                            ingredients=ingredients,
-                        )
-                        coffees_with_scores.append((coffee, similarity))
-
+            # Final tracing
             span.set_attribute("results.count", len(coffees_with_scores))
+            span.set_attribute("search.duration_ms", round(duration * 1000, 2))
+
+            matched_names = [c["name"] for c in all_candidates[:top_k] if c["passed_threshold"]]
+            span.set_attribute("matches.names", ", ".join(matched_names) if matched_names else "none")
+
             return coffees_with_scores
 
     def get_document_count(self) -> int:
@@ -233,11 +448,12 @@ Price: ${coffee.price / 100:.2f}"""
         self,
         query: str,
         top_k: int = None,
-        threshold: float = None
+        threshold: float = None,
+        semantic_weight: float = 0.6,
+        keyword_weight: float = 0.4
     ) -> dict:
-        """Run a search and return raw Chroma results for debugging (no threshold filter).
-        Returns document_count, query, top_k, threshold, and raw_results with id, distance,
-        similarity, and name for each result Chroma returned."""
+        """Run a hybrid search and return detailed results for debugging.
+        Shows semantic scores, keyword scores, and combined hybrid scores."""
         top_k = top_k or settings.retrieval_top_k
         threshold = threshold or settings.retrieval_threshold
         document_count = self.get_document_count()
@@ -246,7 +462,7 @@ Price: ${coffee.price / 100:.2f}"""
         results = self._collection.query(
             query_embeddings=query_embedding,
             n_results=top_k,
-            include=["metadatas", "distances"]
+            include=["documents", "metadatas", "distances"]
         )
 
         raw_results = []
@@ -254,20 +470,35 @@ Price: ${coffee.price / 100:.2f}"""
             for i, doc_id in enumerate(results["ids"][0]):
                 metadata = results["metadatas"][0][i]
                 distance = results["distances"][0][i]
-                similarity = 1 - distance
+
+                semantic_score = 1 - distance
+                bm25_normalized, field_details, bm25_raw = self._bm25_score(query, doc_id)
+                hybrid_score = (semantic_score * semantic_weight) + (bm25_normalized * keyword_weight)
+
                 raw_results.append({
                     "id": doc_id,
-                    "distance": round(distance, 4),
-                    "similarity": round(similarity, 4),
                     "name": metadata.get("name", ""),
-                    "passed_threshold": similarity >= threshold,
+                    "semantic_score": float(round(semantic_score, 4)),
+                    "bm25_score": float(round(bm25_normalized, 4)),
+                    "bm25_raw": float(round(bm25_raw, 4)),
+                    "field_scores": field_details.get("field_scores", {}),
+                    "field_matches": field_details.get("field_matches", {}),
+                    "hybrid_score": float(round(hybrid_score, 4)),
+                    "passed_threshold": bool(hybrid_score >= threshold),
                 })
+
+        # Sort by hybrid score
+        raw_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
 
         return {
             "document_count": document_count,
             "query": query,
+            "query_tokens": self._tokenize(query),
             "top_k": top_k,
             "threshold": threshold,
+            "semantic_weight": semantic_weight,
+            "keyword_weight": keyword_weight,
+            "bm25_field_weights": self.BM25_FIELD_WEIGHTS,
             "raw_results": raw_results,
             "passed_count": sum(1 for r in raw_results if r["passed_threshold"]),
         }

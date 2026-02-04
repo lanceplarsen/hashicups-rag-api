@@ -86,6 +86,24 @@ public_api_request_duration_seconds = Histogram(
     ['endpoint']
 )
 
+# Product Service metrics (REST API for indexing)
+product_service_requests_total = Counter(
+    'product_service_requests_total',
+    'Total requests to Product Service',
+    ['endpoint', 'status']
+)
+
+product_service_request_duration_seconds = Histogram(
+    'product_service_request_duration_seconds',
+    'Product Service request latency',
+    ['endpoint']
+)
+
+product_service_health = Gauge(
+    'product_service_health',
+    'Product Service health status (1=healthy, 0=unhealthy)'
+)
+
 # Health metrics
 service_health = Gauge(
     'service_health',

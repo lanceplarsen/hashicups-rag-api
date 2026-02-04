@@ -23,6 +23,7 @@ class ChromaStore:
     BM25_FIELD_WEIGHTS = {
         "name": 3.0,        # Highest: user searching for specific product
         "ingredients": 2.0, # High: ingredient searches are common
+        "color": 2.5,       # High: color is a specific attribute search
         "content": 1.0      # Base: general description matches
     }
 
@@ -37,12 +38,14 @@ class ChromaStore:
         # Separate BM25 indexes per field for weighted scoring
         self._bm25_name: Optional[BM25Okapi] = None
         self._bm25_ingredients: Optional[BM25Okapi] = None
+        self._bm25_color: Optional[BM25Okapi] = None
         self._bm25_content: Optional[BM25Okapi] = None
         self._bm25_doc_ids: List[str] = []  # Map BM25 index position to doc ID
 
         # Store tokenized corpora for debugging/tracing
         self._corpus_name: List[List[str]] = []
         self._corpus_ingredients: List[List[str]] = []
+        self._corpus_color: List[List[str]] = []
         self._corpus_content: List[List[str]] = []
 
     def initialize(self):
@@ -68,6 +71,86 @@ class ChromaStore:
 
             span.set_attribute("collection.name", self.collection_name)
 
+    # Map hex colors to human-readable names for search
+    COLOR_NAME_MAP = {
+        # HashiCups specific colors
+        "#444": "dark gray charcoal",
+        "#1fa7ee": "sky blue bright blue",
+        "#ffd814": "yellow gold bright yellow",
+        "#00ca8e": "green mint green teal",
+        "#894bd1": "purple violet lavender",
+        "#0e67ed": "blue bright blue royal blue",
+        "#f44d8a": "pink magenta hot pink",
+        "#f24c53": "red coral red bright red",
+        "#14c6cb": "cyan teal turquoise aqua",
+        # Reds
+        "#ff0000": "red", "#8b0000": "dark red", "#dc143c": "crimson red",
+        "#b22222": "firebrick red", "#cd5c5c": "indian red",
+        # Greens
+        "#00ff00": "green", "#008000": "dark green", "#006400": "forest green",
+        "#228b22": "forest green", "#32cd32": "lime green", "#90ee90": "light green",
+        "#98fb98": "pale green", "#2e8b57": "sea green", "#3cb371": "medium green",
+        # Blues
+        "#0000ff": "blue", "#000080": "navy blue", "#00008b": "dark blue",
+        "#4169e1": "royal blue", "#1e90ff": "dodger blue", "#87ceeb": "sky blue",
+        "#add8e6": "light blue", "#4682b4": "steel blue",
+        # Browns/Tans (common for coffee)
+        "#8b4513": "brown", "#a0522d": "sienna brown", "#d2691e": "chocolate brown",
+        "#cd853f": "peru brown", "#deb887": "burlywood tan", "#f4a460": "sandy brown",
+        "#d2b48c": "tan", "#bc8f8f": "rosy brown", "#c4a484": "caramel brown",
+        "#6f4e37": "coffee brown", "#3c280d": "dark roast brown",
+        # Blacks/Grays
+        "#000000": "black", "#444444": "dark gray",
+        "#808080": "gray", "#696969": "dim gray", "#a9a9a9": "dark silver",
+        "#c0c0c0": "silver", "#d3d3d3": "light gray",
+        # Oranges/Yellows
+        "#ffa500": "orange", "#ff8c00": "dark orange", "#ff7f50": "coral orange",
+        "#ffff00": "yellow", "#ffd700": "gold", "#f0e68c": "khaki yellow",
+        # Purples
+        "#800080": "purple", "#4b0082": "indigo purple", "#8b008b": "dark magenta",
+        "#9932cc": "dark orchid purple", "#663399": "rebecca purple",
+        # Whites/Creams
+        "#ffffff": "white", "#fffaf0": "floral white", "#faf0e6": "linen cream",
+        "#fff5ee": "seashell cream", "#f5f5dc": "beige cream", "#ffe4c4": "bisque cream",
+    }
+
+    def _get_color_name(self, hex_color: str) -> str:
+        """Convert hex color to human-readable name."""
+        if not hex_color:
+            return ""
+        # Normalize hex color (lowercase, handle 3-digit shorthand)
+        normalized = hex_color.lower().strip()
+        if normalized in self.COLOR_NAME_MAP:
+            return self.COLOR_NAME_MAP[normalized]
+        # Try to find a close match by checking if it starts with common prefixes
+        # For unknown colors, try to describe based on RGB values
+        if normalized.startswith("#"):
+            try:
+                hex_val = normalized.lstrip("#")
+                if len(hex_val) == 3:
+                    hex_val = "".join([c*2 for c in hex_val])
+                r = int(hex_val[0:2], 16)
+                g = int(hex_val[2:4], 16)
+                b = int(hex_val[4:6], 16)
+                # Simple heuristic for color naming
+                if r > 200 and g > 200 and b > 200:
+                    return "light cream"
+                elif r < 50 and g < 50 and b < 50:
+                    return "black"
+                elif r > g and r > b:
+                    return "reddish brown" if g > 50 else "red"
+                elif g > r and g > b:
+                    return "green"
+                elif b > r and b > g:
+                    return "blue"
+                elif r > 100 and g > 50 and b < 100:
+                    return "brown"
+                else:
+                    return "dark"
+            except (ValueError, IndexError):
+                pass
+        return hex_color  # Return original if can't parse
+
     def _tokenize(self, text: str) -> List[str]:
         """Tokenize text for BM25 indexing. Lowercase and split on non-alphanumeric."""
         return re.findall(r'\w+', text.lower())
@@ -81,10 +164,24 @@ class ChromaStore:
         ]
         return " ".join(parts)
 
+    def _format_ingredient(self, ing: Ingredient) -> str:
+        """Format an ingredient with quantity and unit if available."""
+        if ing.quantity and ing.unit:
+            return f"{ing.quantity} {ing.unit} {ing.name}"
+        elif ing.quantity:
+            return f"{ing.quantity} {ing.name}"
+        return ing.name
+
     def _coffee_to_document(self, coffee: Coffee) -> CoffeeDocument:
         """Convert a Coffee to a document for semantic embedding."""
-        # Build ingredient list
-        ingredients_str = ", ".join([ing.name for ing in coffee.ingredients]) if coffee.ingredients else ""
+        # Build ingredient list with quantities for embedding content
+        ingredients_str = ", ".join([self._format_ingredient(ing) for ing in coffee.ingredients]) if coffee.ingredients else ""
+
+        # Store ingredients as JSON for proper reconstruction
+        ingredients_json = json.dumps([
+            {"id": ing.id, "name": ing.name, "quantity": ing.quantity, "unit": ing.unit}
+            for ing in coffee.ingredients
+        ]) if coffee.ingredients else "[]"
 
         # Build natural content for embedding - no labels, no N/A, no price
         parts = [f"{coffee.name}: {coffee.teaser}"]
@@ -101,6 +198,11 @@ class ChromaStore:
         if coffee.collection:
             parts.append(f"Part of the {coffee.collection} collection.")
 
+        # Convert hex color to human-readable name for embedding
+        color_name = self._get_color_name(coffee.color) if coffee.color else ""
+        if color_name:
+            parts.append(f"Color: {color_name}.")
+
         content = " ".join(parts)
 
         return CoffeeDocument(
@@ -115,7 +217,10 @@ class ChromaStore:
                 "image": coffee.image,
                 "origin": coffee.origin or "",
                 "collection": coffee.collection or "",
-                "ingredients": ingredients_str
+                "color": coffee.color or "",  # Keep original hex for API response
+                "color_name": color_name,  # Human-readable for search/display
+                "ingredients": ingredients_str,  # Formatted string for BM25
+                "ingredients_json": ingredients_json  # JSON for reconstruction
             }
         )
 
@@ -157,16 +262,19 @@ class ChromaStore:
                 # Build separate corpora for each field
                 self._corpus_name = []
                 self._corpus_ingredients = []
+                self._corpus_color = []
                 self._corpus_content = []
 
                 for doc in documents:
                     self._corpus_name.append(self._tokenize(doc.metadata.get("name", "")))
                     self._corpus_ingredients.append(self._tokenize(doc.metadata.get("ingredients", "")))
+                    self._corpus_color.append(self._tokenize(doc.metadata.get("color_name", "")))
                     self._corpus_content.append(self._tokenize(doc.content))
 
                 # Create BM25 index for each field
                 self._bm25_name = BM25Okapi(self._corpus_name) if any(self._corpus_name) else None
                 self._bm25_ingredients = BM25Okapi(self._corpus_ingredients) if any(self._corpus_ingredients) else None
+                self._bm25_color = BM25Okapi(self._corpus_color) if any(self._corpus_color) else None
                 self._bm25_content = BM25Okapi(self._corpus_content) if any(self._corpus_content) else None
 
                 bm25_span.set_attribute("bm25.documents_indexed", len(self._bm25_doc_ids))
@@ -221,6 +329,15 @@ class ChromaStore:
             field_matches["ingredients"] = ing_matches
             weighted_raw_score += ing_raw * self.BM25_FIELD_WEIGHTS["ingredients"]
 
+        # Color field
+        if self._bm25_color:
+            color_scores = self._bm25_color.get_scores(query_tokens)
+            color_raw = color_scores[doc_index]
+            color_matches = [t for t in query_tokens if t in set(self._corpus_color[doc_index])]
+            field_scores["color"] = {"raw": color_raw, "weight": self.BM25_FIELD_WEIGHTS["color"]}
+            field_matches["color"] = color_matches
+            weighted_raw_score += color_raw * self.BM25_FIELD_WEIGHTS["color"]
+
         # Content field
         if self._bm25_content:
             content_scores = self._bm25_content.get_scores(query_tokens)
@@ -238,6 +355,8 @@ class ChromaStore:
                 doc_weighted += self._bm25_name.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["name"]
             if self._bm25_ingredients:
                 doc_weighted += self._bm25_ingredients.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["ingredients"]
+            if self._bm25_color:
+                doc_weighted += self._bm25_color.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["color"]
             if self._bm25_content:
                 doc_weighted += self._bm25_content.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["content"]
             max_weighted = max(max_weighted, doc_weighted)
@@ -254,6 +373,7 @@ class ChromaStore:
             "all_matched_terms": list(set(
                 field_matches.get("name", []) +
                 field_matches.get("ingredients", []) +
+                field_matches.get("color", []) +
                 field_matches.get("content", [])
             ))
         }
@@ -348,14 +468,17 @@ class ChromaStore:
                 # Field-level match summary
                 name_matches = set()
                 ingredient_matches = set()
+                color_matches = set()
                 content_matches = set()
                 for c in all_candidates:
                     name_matches.update(c["field_matches"].get("name", []))
                     ingredient_matches.update(c["field_matches"].get("ingredients", []))
+                    color_matches.update(c["field_matches"].get("color", []))
                     content_matches.update(c["field_matches"].get("content", []))
 
                 span.set_attribute("bm25.name_matches", ", ".join(name_matches) if name_matches else "none")
                 span.set_attribute("bm25.ingredient_matches", ", ".join(ingredient_matches) if ingredient_matches else "none")
+                span.set_attribute("bm25.color_matches", ", ".join(color_matches) if color_matches else "none")
                 span.set_attribute("bm25.content_matches", ", ".join(content_matches) if content_matches else "none")
 
             # Step 4: Build final results
@@ -364,16 +487,25 @@ class ChromaStore:
             for candidate in all_candidates[:top_k]:
                 if candidate["hybrid_score"] >= threshold:
                     metadata = candidate["metadata"]
-                    ingredients_str = metadata.get("ingredients") or ""
 
-                    if ingredients_str and ingredients_str != "N/A":
-                        ingredients = [
-                            Ingredient(id=idx, name=part.strip())
-                            for idx, part in enumerate(ingredients_str.split(","))
-                            if part.strip()
-                        ]
-                    else:
-                        ingredients = []
+                    # Parse ingredients from JSON (preferred) or fall back to string parsing
+                    ingredients = []
+                    ingredients_json = metadata.get("ingredients_json")
+                    if ingredients_json:
+                        try:
+                            ingredients_data = json.loads(ingredients_json)
+                            ingredients = [
+                                Ingredient(
+                                    id=ing.get("id", idx),
+                                    name=ing.get("name", ""),
+                                    quantity=ing.get("quantity"),
+                                    unit=ing.get("unit")
+                                )
+                                for idx, ing in enumerate(ingredients_data)
+                                if ing.get("name")
+                            ]
+                        except json.JSONDecodeError:
+                            pass
 
                     coffee = Coffee(
                         id=metadata["coffee_id"],
@@ -384,6 +516,7 @@ class ChromaStore:
                         image=metadata["image"],
                         origin=metadata.get("origin") or None,
                         collection=metadata.get("collection") or None,
+                        color=metadata.get("color") or None,
                         ingredients=ingredients,
                     )
                     coffees_with_scores.append((coffee, candidate["hybrid_score"]))
@@ -418,15 +551,25 @@ class ChromaStore:
             if results["ids"]:
                 for i, doc_id in enumerate(results["ids"]):
                     metadata = results["metadatas"][i]
-                    ingredients_str = metadata.get("ingredients") or ""
-                    if ingredients_str and ingredients_str != "N/A":
-                        ingredients = [
-                            Ingredient(id=idx, name=part.strip())
-                            for idx, part in enumerate(ingredients_str.split(","))
-                            if part.strip()
-                        ]
-                    else:
-                        ingredients = []
+
+                    # Parse ingredients from JSON (preferred) or fall back to empty
+                    ingredients = []
+                    ingredients_json = metadata.get("ingredients_json")
+                    if ingredients_json:
+                        try:
+                            ingredients_data = json.loads(ingredients_json)
+                            ingredients = [
+                                Ingredient(
+                                    id=ing.get("id", idx),
+                                    name=ing.get("name", ""),
+                                    quantity=ing.get("quantity"),
+                                    unit=ing.get("unit")
+                                )
+                                for idx, ing in enumerate(ingredients_data)
+                                if ing.get("name")
+                            ]
+                        except json.JSONDecodeError:
+                            pass
 
                     coffee = Coffee(
                         id=metadata["coffee_id"],
@@ -437,6 +580,7 @@ class ChromaStore:
                         image=metadata["image"],
                         origin=metadata.get("origin") or None,
                         collection=metadata.get("collection") or None,
+                        color=metadata.get("color") or None,
                         ingredients=ingredients,
                     )
                     coffees.append(coffee)

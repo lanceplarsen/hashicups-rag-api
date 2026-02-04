@@ -6,6 +6,8 @@ class Ingredient(BaseModel):
     """Coffee ingredient model."""
     id: int
     name: str
+    quantity: Optional[int] = None
+    unit: Optional[str] = None
 
 
 class Coffee(BaseModel):
@@ -18,6 +20,7 @@ class Coffee(BaseModel):
     image: str
     origin: Optional[str] = None
     collection: Optional[str] = None
+    color: Optional[str] = None  # Hex color code like "#444"
     ingredients: Optional[List[Ingredient]] = []
 
 

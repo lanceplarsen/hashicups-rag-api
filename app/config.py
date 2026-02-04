@@ -25,9 +25,13 @@ class Settings(BaseSettings):
     bind_address: str = "0.0.0.0:8080"
     metrics_address: str = "0.0.0.0:9102"
 
-    # Public API settings (GraphQL)
+    # Public API settings (GraphQL) - used for chat endpoint
     public_api_uri: str = "http://public-api:8080/api"
     public_api_timeout: int = 10
+
+    # Product Service settings (REST API) - used for indexing
+    product_service_uri: str = "http://product-api:9090"
+    product_service_timeout: int = 10
 
     # Secrets directory (for file-mounted secrets)
     secrets_dir: str = "/etc/secrets"
@@ -62,7 +66,7 @@ class Settings(BaseSettings):
 
     # RAG settings
     retrieval_top_k: int = 5
-    retrieval_threshold: float = 0.4
+    retrieval_threshold: float = 0.3
 
     # Indexer settings
     index_interval_seconds: int = 300

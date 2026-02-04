@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional
 import logging
 
-from app.client.public_api import PublicAPIClient
+from app.client.product_service import ProductServiceClient
 from app.vectorstore.chroma_store import ChromaStore
 from app.config import settings
 from app.tracer import tracer
@@ -93,12 +93,12 @@ class IndexerService:
             try:
                 logger.info("Starting indexing operation")
 
-                # Fetch coffees from Public API
-                async with PublicAPIClient() as client:
+                # Fetch coffees from Product Service
+                async with ProductServiceClient() as client:
                     coffees = await client.get_coffees()
 
                 span.set_attribute("coffees.fetched", len(coffees))
-                logger.info(f"Fetched {len(coffees)} coffees from Public API")
+                logger.info(f"Fetched {len(coffees)} coffees from Product Service")
 
                 # Index into Chroma
                 indexed_count = self.chroma_store.index_coffees(coffees)

@@ -103,7 +103,7 @@ class RAGPipeline:
 - Origin: {coffee.origin or 'N/A'}
 - Collection: {coffee.collection or 'N/A'}
 - Ingredients: {ingredients_str}
-- Price: ${coffee.price:.2f}
+- Price: ${coffee.price / 100:.2f}
 """
             context_parts.append(coffee_info)
 

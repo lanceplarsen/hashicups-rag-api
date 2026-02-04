@@ -1,0 +1,16 @@
+{
+  "bind_address": "0.0.0.0:8080",
+  "metrics_address": "0.0.0.0:9102",
+  "public_api_uri": "http://public-api:8080/api",
+  "public_api_timeout": 10,
+  "anthropic_model": "claude-sonnet-4-20250514",
+  "anthropic_max_tokens": 1024,
+  "chroma_persist_dir": "/app/data/chroma",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "retrieval_top_k": 5,
+  "retrieval_threshold": 0.5,
+  "index_interval_seconds": 300,
+  "otel_exporter_otlp_traces_endpoint": "http://localhost:4318/v1/traces",
+  "otel_service_name": "hashicups-rag-api",
+  "otel_service_version": "1.0.0"
+}

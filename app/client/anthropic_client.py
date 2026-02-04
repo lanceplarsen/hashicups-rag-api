@@ -15,26 +15,125 @@ from app.metrics import (
 )
 
 
-SYSTEM_PROMPT = """You are a helpful coffee expert assistant for HashiCups, a specialty coffee shop.
-Your role is to help customers find the perfect coffee based on their preferences and needs.
+SYSTEM_PROMPT = """You are a friendly barista at HashiCups, a specialty coffee shop.
 
-When answering questions:
-- Use the provided coffee catalog information to give accurate recommendations
-- Be friendly and enthusiastic about coffee
-- If a customer's preferences don't match any coffees well, suggest the closest alternatives
-- Include specific details like origin, ingredients, and flavor notes when relevant
-- Keep responses concise but informative
+You genuinely love coffee and enjoy chatting with customers. You can:
+- Recommend coffees based on mood, taste, or occasion
+- Have casual conversation while naturally weaving in coffee suggestions
+- Pick up on cues like "tired", "celebrating", "stressed" to suggest fitting drinks
+- Share enthusiasm about your favorite drinks on the menu
 
-If asked about something not related to coffee or the HashiCups menu, politely redirect the conversation to coffee topics."""
+Use the coffee catalog below to make personalized recommendations, but don't just list
+products - be a real barista who connects with customers. Keep responses concise and warm.
+
+If someone asks something completely off-topic (politics, tech support, etc.), gently
+steer back: "Ha, I'm more of a coffee expert than a {topic} expert! Speaking of
+pick-me-ups though..." """
+
+INTENT_CLASSIFICATION_PROMPT = """Classify this coffee shop customer message into exactly one category:
+
+- coffee_search: Looking for specific coffee by flavor, origin, ingredients, or type
+- conversational: Mood, greeting, occasion, or chat that could relate to coffee recommendations
+- off_topic: Completely unrelated to coffee or a coffee shop visit
+
+Message: "{message}"
+
+Reply with only the category name, nothing else."""
+
+QUERY_REWRITE_PROMPT = """Rewrite the customer's latest message as a standalone coffee search query.
+Include relevant context from the conversation so the query makes sense on its own.
+
+Conversation:
+{history}
+
+Latest message: "{message}"
+
+Rewritten search query (just the query, nothing else):"""
 
 
 class AnthropicClient:
     """Claude API client with tracing and metrics."""
 
+    INTENT_MODEL = "claude-3-haiku-20240307"
+
     def __init__(self):
         self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
         self.model = settings.anthropic_model
         self.max_tokens = settings.anthropic_max_tokens
+
+    async def classify_intent(self, message: str) -> str:
+        """Classify user message intent using Haiku for fast/cheap classification."""
+        with tracer.start_as_current_span("anthropic.classify_intent") as span:
+            span.set_attribute("llm.model", self.INTENT_MODEL)
+            span.set_attribute("message", message)
+
+            try:
+                ctx = contextvars.copy_context()
+                def _do_classify():
+                    return self.client.messages.create(
+                        model=self.INTENT_MODEL,
+                        max_tokens=20,
+                        messages=[{
+                            "role": "user",
+                            "content": INTENT_CLASSIFICATION_PROMPT.format(message=message)
+                        }]
+                    )
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: ctx.run(_do_classify)
+                )
+
+                intent = response.content[0].text.strip().lower()
+
+                # Validate intent is one of expected values
+                if intent not in ("coffee_search", "conversational", "off_topic"):
+                    intent = "coffee_search"  # default fallback
+
+                span.set_attribute("intent", intent)
+                return intent
+
+            except Exception as e:
+                span.record_exception(e)
+                return "coffee_search"  # fallback on error
+
+    async def rewrite_query(self, message: str, conversation_history: List[Message]) -> str:
+        """Rewrite a follow-up message as a standalone search query using conversation context."""
+        with tracer.start_as_current_span("anthropic.rewrite_query") as span:
+            span.set_attribute("llm.model", self.INTENT_MODEL)
+            span.set_attribute("original_message", message)
+
+            try:
+                # Format conversation history
+                history_str = "\n".join([
+                    f"{msg.role.capitalize()}: {msg.content}"
+                    for msg in conversation_history[-6:]  # Last 3 turns max
+                ])
+
+                ctx = contextvars.copy_context()
+                def _do_rewrite():
+                    return self.client.messages.create(
+                        model=self.INTENT_MODEL,
+                        max_tokens=100,
+                        messages=[{
+                            "role": "user",
+                            "content": QUERY_REWRITE_PROMPT.format(
+                                history=history_str,
+                                message=message
+                            )
+                        }]
+                    )
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: ctx.run(_do_rewrite)
+                )
+
+                rewritten = response.content[0].text.strip()
+                span.set_attribute("rewritten_query", rewritten)
+                return rewritten
+
+            except Exception as e:
+                span.record_exception(e)
+                return message  # fallback to original on error
 
     async def generate(
         self,

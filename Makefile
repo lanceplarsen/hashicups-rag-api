@@ -1,4 +1,4 @@
-.PHONY: build run test clean docker-build docker-run
+.PHONY: build run test clean docker-build docker-buildx docker-buildx-setup docker-run
 
 # Python virtual environment
 VENV := .venv
@@ -6,8 +6,8 @@ PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
 # Docker
-IMAGE_NAME := hashicups-rag-api
-IMAGE_TAG := latest
+IMAGE_NAME := 767397794709.dkr.ecr.us-west-2.amazonaws.com/hashicups/rag-api
+IMAGE_TAG := v0.0.2
 
 # Development
 install: $(VENV)
@@ -33,6 +33,17 @@ format:
 # Docker
 docker-build:
 	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) .
+
+# Create buildx builder (run once if you get "no builder" errors)
+docker-buildx-setup:
+	docker buildx create --name multiarch --use 2>/dev/null || docker buildx use multiarch
+
+# Multi-arch build (amd64 + arm64) and push via buildx
+docker-buildx: docker-buildx-setup
+	docker buildx build --platform linux/amd64,linux/arm64 \
+		-t $(IMAGE_NAME):$(IMAGE_TAG) \
+		--provenance=false \
+		--push .
 
 docker-run:
 	docker run -p 8080:8080 -p 9102:9102 \

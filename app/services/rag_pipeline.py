@@ -28,7 +28,7 @@ class RAGPipeline:
         message: str,
         conversation_history: List[Message] = None
     ) -> ChatResponse:
-        """Execute the full RAG pipeline."""
+        """Execute the full RAG pipeline with intent-based routing."""
         with tracer.start_as_current_span("rag_pipeline.query") as span:
             start_time = time.time()
 
@@ -37,30 +37,45 @@ class RAGPipeline:
 
             conversation_history = conversation_history or []
 
-            # Step 1: Retrieve relevant coffees
-            with tracer.start_as_current_span("rag_pipeline.retrieve"):
-                retrieved = self.chroma_store.search(message)
-                rag_retrieval_count.observe(len(retrieved))
+            # Step 1: Classify intent using Haiku (fast & cheap)
+            with tracer.start_as_current_span("rag_pipeline.classify_intent"):
+                intent = await self.anthropic_client.classify_intent(message)
 
-            span.set_attribute("retrieval.count", len(retrieved))
+            span.set_attribute("intent", intent)
 
-            # Early exit when no coffees match — skip LLM call to save latency and cost
-            if not retrieved:
-                latency_ms = (time.time() - start_time) * 1000
-                rag_pipeline_duration_seconds.observe(latency_ms / 1000)
-                span.set_attribute("response.length", 0)
-                span.set_attribute("latency_ms", latency_ms)
-                return ChatResponse(
-                    response="We couldn't find any coffees that match that. Try describing taste, origin, or style (e.g. espresso, light roast, fruity).",
-                    retrieved_coffees=[],
-                    token_usage=TokenUsage(input_tokens=0, output_tokens=0),
-                    latency_ms=round(latency_ms, 2)
-                )
+            # Step 2: Route based on intent
+            retrieved = []
+            search_query = message
 
-            # Step 2: Build context from retrieved documents
-            context = self._build_context(retrieved)
+            if intent == "coffee_search":
+                # Rewrite query if there's conversation history (for multi-turn context)
+                if conversation_history:
+                    with tracer.start_as_current_span("rag_pipeline.rewrite_query"):
+                        search_query = await self.anthropic_client.rewrite_query(
+                            message, conversation_history
+                        )
+                    span.set_attribute("rewritten_query", search_query)
 
-            # Step 3: Generate response with Claude
+                # Do semantic search for specific coffee queries
+                with tracer.start_as_current_span("rag_pipeline.retrieve"):
+                    retrieved = self.chroma_store.search(search_query)
+                    rag_retrieval_count.observe(len(retrieved))
+                span.set_attribute("retrieval.count", len(retrieved))
+
+            # Step 3: Build context based on intent and retrieval results
+            if intent == "coffee_search" and retrieved:
+                # Use retrieved coffees for targeted recommendations
+                context = self._build_context(retrieved)
+            elif intent == "off_topic":
+                # Minimal context for off-topic messages
+                context = "Customer is asking about something unrelated to coffee."
+            else:
+                # For conversational messages or coffee_search with no results,
+                # provide full catalog so Claude can make natural suggestions
+                all_coffees = self.chroma_store.get_all_coffees()
+                context = self._build_catalog_context(all_coffees)
+
+            # Step 4: Generate response with Claude
             response_text, token_usage = await self.anthropic_client.generate(
                 context=context,
                 messages=conversation_history,
@@ -74,7 +89,8 @@ class RAGPipeline:
             span.set_attribute("response.length", len(response_text))
             span.set_attribute("latency_ms", latency_ms)
 
-            # Build response
+            # Build response - include retrieved coffees for coffee_search,
+            # or top suggestions for conversational
             retrieved_coffees = [
                 RetrievedCoffee(coffee=coffee, similarity_score=round(score, 4))
                 for coffee, score in retrieved
@@ -88,7 +104,7 @@ class RAGPipeline:
             )
 
     def _build_context(self, retrieved: list) -> str:
-        """Build context string from retrieved coffees."""
+        """Build context string from retrieved coffees with relevance scores."""
         if not retrieved:
             return "No matching coffees found in the catalog."
 
@@ -102,6 +118,25 @@ class RAGPipeline:
 - Description: {coffee.description}
 - Origin: {coffee.origin or 'N/A'}
 - Collection: {coffee.collection or 'N/A'}
+- Ingredients: {ingredients_str}
+- Price: ${coffee.price / 100:.2f}
+"""
+            context_parts.append(coffee_info)
+
+        return "\n".join(context_parts)
+
+    def _build_catalog_context(self, coffees: list) -> str:
+        """Build context string from full coffee catalog (for conversational messages)."""
+        if not coffees:
+            return "The coffee catalog is currently empty."
+
+        context_parts = ["Here's our full menu - feel free to suggest any that fit the conversation:\n"]
+        for coffee in coffees:
+            ingredients_str = ", ".join([ing.name for ing in coffee.ingredients]) if coffee.ingredients else "N/A"
+
+            coffee_info = f"""---
+**{coffee.name}**
+- Teaser: {coffee.teaser}
 - Ingredients: {ingredients_str}
 - Price: ${coffee.price / 100:.2f}
 """

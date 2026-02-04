@@ -62,7 +62,7 @@ Description: {coffee.description}
 Teaser: {coffee.teaser}
 Origin: {coffee.origin or 'N/A'}
 Collection: {coffee.collection or 'N/A'}
-Price: ${coffee.price:.2f}"""
+Price: ${coffee.price / 100:.2f}"""
 
         return CoffeeDocument(
             id=str(coffee.id),
@@ -190,6 +190,44 @@ Price: ${coffee.price:.2f}"""
         if self._collection:
             return self._collection.count()
         return 0
+
+    def get_all_coffees(self) -> List[Coffee]:
+        """Retrieve all coffees from the store (for conversational context)."""
+        with tracer.start_as_current_span("chroma.get_all_coffees") as span:
+            if not self._collection:
+                return []
+
+            results = self._collection.get(include=["metadatas"])
+
+            coffees = []
+            if results["ids"]:
+                for i, doc_id in enumerate(results["ids"]):
+                    metadata = results["metadatas"][i]
+                    ingredients_str = metadata.get("ingredients") or ""
+                    if ingredients_str and ingredients_str != "N/A":
+                        ingredients = [
+                            Ingredient(id=idx, name=part.strip())
+                            for idx, part in enumerate(ingredients_str.split(","))
+                            if part.strip()
+                        ]
+                    else:
+                        ingredients = []
+
+                    coffee = Coffee(
+                        id=metadata["coffee_id"],
+                        name=metadata["name"],
+                        teaser=metadata["teaser"],
+                        description=metadata["description"],
+                        price=metadata["price"],
+                        image=metadata["image"],
+                        origin=metadata.get("origin") or None,
+                        collection=metadata.get("collection") or None,
+                        ingredients=ingredients,
+                    )
+                    coffees.append(coffee)
+
+            span.set_attribute("coffees.count", len(coffees))
+            return coffees
 
     def search_debug(
         self,

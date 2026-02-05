@@ -61,8 +61,8 @@ class IndexerService:
         self._running = True
         logger.info("Starting indexer service")
 
-        # Run initial index
-        await self._run_index()
+        # Run initial index with retries (product service may not be ready yet)
+        await self._run_index_with_retry()
 
         # Start background task
         self._task = asyncio.create_task(self._background_loop())
@@ -177,6 +177,24 @@ class IndexerService:
             logger.info(f"Enrichment complete: {generated_count} generated, {cached_count} cached")
 
             return descriptions
+
+    async def _run_index_with_retry(self, max_retries: int = 5, base_delay: float = 3.0):
+        """Run indexing with retry and exponential backoff for startup resilience."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                await self._run_index()
+                return
+            except Exception as e:
+                if attempt == max_retries:
+                    logger.error(f"Indexing failed after {max_retries} attempts: {e}")
+                    self._index_status = f"error: {str(e)}"
+                    return  # Don't crash the app - background loop will keep retrying
+                delay = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Indexing attempt {attempt}/{max_retries} failed: {e}. "
+                    f"Retrying in {delay:.0f}s..."
+                )
+                await asyncio.sleep(delay)
 
     async def _run_index(self):
         """Run a single indexing operation."""

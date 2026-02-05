@@ -172,6 +172,9 @@ class ChromaStore:
         # Coffee-query noise words
         "something", "like", "want", "need", "looking", "give", "get",
         "good", "nice", "great", "really", "drink", "one", "got",
+        # No domain stop words needed: BM25 IDF naturally downweights terms
+        # that appear in every document, while preserving discriminative value
+        # in fields where they don't (e.g. "coffee" in ingredients vs content).
     })
 
     def _tokenize(self, text: str) -> List[str]:
@@ -248,7 +251,8 @@ class ChromaStore:
                 "color": coffee.color or "",  # Keep original hex for API response
                 "color_name": color_name,  # Human-readable for search/display
                 "ingredients": ingredients_str,  # Formatted string for BM25
-                "ingredients_json": ingredients_json  # JSON for reconstruction
+                "ingredients_json": ingredients_json,  # JSON for reconstruction
+                "enrichment": enriched_description  # LLM-generated flavor/style notes
             }
         )
 
@@ -322,6 +326,25 @@ class ChromaStore:
                     sum(len(doc) for doc in self._corpus_ingredients) / len(self._corpus_ingredients) if self._corpus_ingredients else 0)
                 bm25_span.set_attribute("bm25.avg_content_tokens",
                     sum(len(doc) for doc in self._corpus_content) / len(self._corpus_content) if self._corpus_content else 0)
+
+                # Trace per-document content and tokenized fields for index verification
+                for i, doc in enumerate(documents):
+                    doc_name = doc.metadata.get("name", f"doc_{i}")
+                    bm25_span.set_attribute(
+                        f"doc.{doc.id}.{doc_name}.content", doc.content
+                    )
+                    bm25_span.set_attribute(
+                        f"doc.{doc.id}.{doc_name}.tokens.name",
+                        " ".join(self._corpus_name[i])
+                    )
+                    bm25_span.set_attribute(
+                        f"doc.{doc.id}.{doc_name}.tokens.ingredients",
+                        " ".join(self._corpus_ingredients[i])
+                    )
+                    bm25_span.set_attribute(
+                        f"doc.{doc.id}.{doc_name}.tokens.content",
+                        " ".join(self._corpus_content[i])
+                    )
 
             # Update metrics
             vectorstore_documents_total.set(len(documents))
@@ -570,6 +593,7 @@ class ChromaStore:
                         collection=metadata.get("collection") or None,
                         color=metadata.get("color") or None,
                         ingredients=ingredients,
+                        enrichment=metadata.get("enrichment") or None,
                     )
                     coffees_with_scores.append((coffee, candidate["hybrid_score"]))
 
@@ -634,6 +658,7 @@ class ChromaStore:
                         collection=metadata.get("collection") or None,
                         color=metadata.get("color") or None,
                         ingredients=ingredients,
+                        enrichment=metadata.get("enrichment") or None,
                     )
                     coffees.append(coffee)
 

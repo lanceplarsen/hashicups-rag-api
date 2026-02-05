@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # Product Service settings (REST API) - used for indexing
     product_service_uri: str = "http://product-api:9090"
-    product_service_timeout: int = 10
+    product_service_timeout: int = 30
 
     # Secrets directory (for file-mounted secrets)
     secrets_dir: str = "/etc/secrets"

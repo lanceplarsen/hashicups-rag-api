@@ -23,7 +23,7 @@ class ProductServiceClient:
 
     async def __aenter__(self):
         self._client = httpx.AsyncClient(
-            timeout=self.timeout
+            timeout=httpx.Timeout(self.timeout, connect=self.timeout)
         )
         return self
 

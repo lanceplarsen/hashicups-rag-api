@@ -22,6 +22,7 @@ class Coffee(BaseModel):
     collection: Optional[str] = None
     color: Optional[str] = None  # Hex color code like "#444"
     ingredients: Optional[List[Ingredient]] = []
+    enrichment: Optional[str] = None  # LLM-generated flavor/style notes
 
 
 class Message(BaseModel):

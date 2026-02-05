@@ -239,6 +239,7 @@ Do NOT invent details about products. Only reference products by name to redirec
         for coffee, score in retrieved:
             ingredients_str = ", ".join([self._format_ingredient(ing) for ing in coffee.ingredients]) if coffee.ingredients else "N/A"
 
+            enrichment_line = f"\n- Tasting Notes: {coffee.enrichment}" if coffee.enrichment else ""
             coffee_info = f"""---
 **{coffee.name}** (Relevance: {score:.0%})
 - Teaser: {coffee.teaser}
@@ -247,7 +248,7 @@ Do NOT invent details about products. Only reference products by name to redirec
 - Collection: {coffee.collection or 'N/A'}
 - Color: {self._get_color_name(coffee.color)}
 - Ingredients: {ingredients_str}
-- Price: ${coffee.price / 100:.2f}
+- Price: ${coffee.price / 100:.2f}{enrichment_line}
 """
             context_parts.append(coffee_info)
 
@@ -262,6 +263,7 @@ Do NOT invent details about products. Only reference products by name to redirec
         for coffee in coffees:
             ingredients_str = ", ".join([self._format_ingredient(ing) for ing in coffee.ingredients]) if coffee.ingredients else "N/A"
 
+            enrichment_line = f"\n- Tasting Notes: {coffee.enrichment}" if coffee.enrichment else ""
             coffee_info = f"""---
 **{coffee.name}**
 - Teaser: {coffee.teaser}
@@ -269,7 +271,7 @@ Do NOT invent details about products. Only reference products by name to redirec
 - Collection: {coffee.collection or 'N/A'}
 - Color: {self._get_color_name(coffee.color)}
 - Ingredients: {ingredients_str}
-- Price: ${coffee.price / 100:.2f}
+- Price: ${coffee.price / 100:.2f}{enrichment_line}
 """
             context_parts.append(coffee_info)
 

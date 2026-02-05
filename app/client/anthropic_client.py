@@ -35,10 +35,11 @@ pick-me-ups though..." """
 
 INTENT_CLASSIFICATION_PROMPT = """Classify this coffee shop customer message into exactly one category:
 
-- coffee_search: Asking about a specific drink by name, or searching by flavor, origin, ingredients, color, collection, price, or type. Includes any product name that could be a menu item (even unfamiliar names like "Connectaccino", "Vaulted Latte", etc.)
-- conversational: Mood, greeting, occasion, general chat, OR comparative questions about the menu (e.g., "what coffee has the most caffeine?", "what's the strongest?", "compare your options", "what do you recommend?")
+- coffee_search: Asking about a specific drink by name, or searching by a single specific attribute like flavor, origin, ingredients, color, collection, price, or type. Includes any product name that could be a menu item (even unfamiliar names like "Connectaccino", "Vaulted Latte", etc.)
+- conversational: Mood, greeting, occasion, general chat, OR any question that compares, ranks, or asks about extremes across the menu (e.g., "what's the lightest roast?", "compare your darkest to your lightest", "what has the most caffeine?", "what's the strongest?", "which is cheapest?", "what do you recommend?", "what's the difference between X and Y?")
 - off_topic: Completely unrelated to coffee, drinks, or a coffee shop visit (e.g., politics, tech support, weather)
 
+When in doubt between coffee_search and conversational, choose conversational if the question requires looking at multiple products to answer.
 When in doubt between coffee_search and off_topic, choose coffee_search - the customer is at a coffee shop.
 
 Message: "{message}"
@@ -286,7 +287,10 @@ class AnthropicClient:
 
 Include:
 - What traditional coffee style it's closest to (e.g., americano, latte, cappuccino, espresso shot, drip coffee, pour-over)
-- What the taste/body is like based on the ingredients
+- Likely roast level (light, medium, dark) inferred from the name, style, and ingredients
+- Caffeine intensity (mild, moderate, strong, extra strong) based on the drink type and ingredients
+- Flavor and taste associations (e.g., chocolate, caramel, vanilla, nutty, fruity, citrus, floral, smoky, earthy, spicy, sweet, bitter, creamy) - include what flavors a customer would likely taste or associate with this drink
+- What the body/mouthfeel is like (light, medium, full-bodied, creamy, syrupy)
 - What kind of mood, occasion, or person it suits
 - Common synonyms or related terms a customer might use to search for this type of drink
 

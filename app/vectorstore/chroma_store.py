@@ -154,9 +154,30 @@ class ChromaStore:
                 pass
         return hex_color  # Return original if can't parse
 
+    # Common English stop words that add noise to BM25 scoring
+    STOP_WORDS = frozenset({
+        "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "is", "it", "its", "as", "be", "was",
+        "are", "been", "being", "have", "has", "had", "do", "does", "did",
+        "will", "would", "could", "should", "may", "might", "can", "shall",
+        "not", "no", "nor", "so", "if", "then", "than", "that", "this",
+        "these", "those", "what", "which", "who", "whom", "how", "when",
+        "where", "why", "all", "each", "every", "both", "few", "more",
+        "most", "some", "any", "such", "only", "own", "same", "just",
+        "very", "also", "about", "up", "out", "into", "over", "after",
+        "before", "between", "under", "again", "further", "here", "there",
+        "once", "during", "while", "through", "above", "below",
+        "i", "me", "my", "we", "our", "you", "your", "he", "him", "his",
+        "she", "her", "they", "them", "their",
+        # Coffee-query noise words
+        "something", "like", "want", "need", "looking", "give", "get",
+        "good", "nice", "great", "really", "drink", "one", "got",
+    })
+
     def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text for BM25 indexing. Lowercase and split on non-alphanumeric."""
-        return re.findall(r'\w+', text.lower())
+        """Tokenize text for BM25 indexing. Lowercase, split, and remove stop words."""
+        tokens = re.findall(r'\w+', text.lower())
+        return [t for t in tokens if t not in self.STOP_WORDS]
 
     def _build_searchable_text(self, metadata: dict, content: str) -> str:
         """Build searchable text combining name, ingredients, and content."""
@@ -175,7 +196,7 @@ class ChromaStore:
             return f"{ing.quantity} {ing.name}"
         return ing.name
 
-    def _coffee_to_document(self, coffee: Coffee) -> CoffeeDocument:
+    def _coffee_to_document(self, coffee: Coffee, enriched_description: str = "") -> CoffeeDocument:
         """Convert a Coffee to a document for semantic embedding."""
         # Build ingredient list with quantities for embedding content
         ingredients_str = ", ".join([self._format_ingredient(ing) for ing in coffee.ingredients]) if coffee.ingredients else ""
@@ -206,6 +227,10 @@ class ChromaStore:
         if color_name:
             parts.append(f"Color: {color_name}.")
 
+        # Append LLM-generated coffee-domain description for better semantic search
+        if enriched_description:
+            parts.append(enriched_description)
+
         content = " ".join(parts)
 
         return CoffeeDocument(
@@ -227,16 +252,22 @@ class ChromaStore:
             }
         )
 
-    def index_coffees(self, coffees: List[Coffee]) -> int:
+    def index_coffees(self, coffees: List[Coffee], enriched_descriptions: Dict[int, str] = None) -> int:
         """Index a list of coffees into the vector store."""
         with tracer.start_as_current_span("chroma.index_coffees") as span:
             span.set_attribute("coffees.count", len(coffees))
+            span.set_attribute("enriched_descriptions.count", len(enriched_descriptions) if enriched_descriptions else 0)
 
             if not coffees:
                 return 0
 
+            enriched_descriptions = enriched_descriptions or {}
+
             # Convert coffees to documents
-            documents = [self._coffee_to_document(c) for c in coffees]
+            documents = [
+                self._coffee_to_document(c, enriched_descriptions.get(c.id, ""))
+                for c in coffees
+            ]
 
             # Generate embeddings
             contents = [doc.content for doc in documents]

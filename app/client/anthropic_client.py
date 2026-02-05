@@ -276,6 +276,43 @@ class AnthropicClient:
                 span.record_exception(e)
                 raise
 
+    async def generate_coffee_description(self, name: str, teaser: str, description: str, ingredients: str) -> str:
+        """Generate a natural coffee-domain description for search enrichment using Haiku."""
+        with tracer.start_as_current_span("anthropic.generate_coffee_description") as span:
+            span.set_attribute("llm.model", self.INTENT_MODEL)
+            span.set_attribute("coffee.name", name)
+
+            prompt = f"""You are helping build a search index for a coffee shop. Given a coffee product, write 2-3 sentences describing it as a real coffee drink.
+
+Include:
+- What traditional coffee style it's closest to (e.g., americano, latte, cappuccino, espresso shot, drip coffee, pour-over)
+- What the taste/body is like based on the ingredients
+- What kind of mood, occasion, or person it suits
+- Common synonyms or related terms a customer might use to search for this type of drink
+
+Product:
+  Name: {name}
+  Teaser: {teaser}
+  Description: {description}
+  Ingredients: {ingredients}
+
+Write only the description, nothing else. Keep it to 2-3 sentences."""
+
+            try:
+                response = await self.client.messages.create(
+                    model=self.INTENT_MODEL,
+                    max_tokens=200,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+
+                result = response.content[0].text.strip()
+                span.set_attribute("enrichment.length", len(result))
+                return result
+
+            except Exception as e:
+                span.record_exception(e)
+                return ""
+
     async def health_check(self) -> bool:
         """Check if Anthropic API is accessible."""
         try:

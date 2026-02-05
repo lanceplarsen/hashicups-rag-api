@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize and start indexer
     logger.info("Starting indexer service...")
-    indexer_service = IndexerService(chroma_store)
+    indexer_service = IndexerService(chroma_store, anthropic_client)
     await indexer_service.start()
 
     # Set dependencies for handlers

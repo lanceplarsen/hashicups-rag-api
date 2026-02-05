@@ -22,6 +22,7 @@ class ChromaStore:
     # Field weights for BM25 scoring (tune these for your use case)
     BM25_FIELD_WEIGHTS = {
         "name": 3.0,        # Highest: user searching for specific product
+        "collection": 3.0,  # Highest: collection is a categorical grouping
         "ingredients": 2.0, # High: ingredient searches are common
         "color": 2.5,       # High: color is a specific attribute search
         "content": 1.0      # Base: general description matches
@@ -37,6 +38,7 @@ class ChromaStore:
 
         # Separate BM25 indexes per field for weighted scoring
         self._bm25_name: Optional[BM25Okapi] = None
+        self._bm25_collection: Optional[BM25Okapi] = None
         self._bm25_ingredients: Optional[BM25Okapi] = None
         self._bm25_color: Optional[BM25Okapi] = None
         self._bm25_content: Optional[BM25Okapi] = None
@@ -44,6 +46,7 @@ class ChromaStore:
 
         # Store tokenized corpora for BM25 and tracing
         self._corpus_name: List[List[str]] = []
+        self._corpus_collection: List[List[str]] = []
         self._corpus_ingredients: List[List[str]] = []
         self._corpus_color: List[List[str]] = []
         self._corpus_content: List[List[str]] = []
@@ -261,18 +264,21 @@ class ChromaStore:
 
                 # Build separate corpora for each field
                 self._corpus_name = []
+                self._corpus_collection = []
                 self._corpus_ingredients = []
                 self._corpus_color = []
                 self._corpus_content = []
 
                 for doc in documents:
                     self._corpus_name.append(self._tokenize(doc.metadata.get("name", "")))
+                    self._corpus_collection.append(self._tokenize(doc.metadata.get("collection", "")))
                     self._corpus_ingredients.append(self._tokenize(doc.metadata.get("ingredients", "")))
                     self._corpus_color.append(self._tokenize(doc.metadata.get("color_name", "")))
                     self._corpus_content.append(self._tokenize(doc.content))
 
                 # Create BM25 index for each field
                 self._bm25_name = BM25Okapi(self._corpus_name) if any(self._corpus_name) else None
+                self._bm25_collection = BM25Okapi(self._corpus_collection) if any(self._corpus_collection) else None
                 self._bm25_ingredients = BM25Okapi(self._corpus_ingredients) if any(self._corpus_ingredients) else None
                 self._bm25_color = BM25Okapi(self._corpus_color) if any(self._corpus_color) else None
                 self._bm25_content = BM25Okapi(self._corpus_content) if any(self._corpus_content) else None
@@ -320,6 +326,15 @@ class ChromaStore:
             field_matches["name"] = name_matches
             weighted_raw_score += name_raw * self.BM25_FIELD_WEIGHTS["name"]
 
+        # Collection field
+        if self._bm25_collection:
+            col_scores = self._bm25_collection.get_scores(query_tokens)
+            col_raw = col_scores[doc_index]
+            col_matches = [t for t in query_tokens if t in set(self._corpus_collection[doc_index])]
+            field_scores["collection"] = {"raw": col_raw, "weight": self.BM25_FIELD_WEIGHTS["collection"]}
+            field_matches["collection"] = col_matches
+            weighted_raw_score += col_raw * self.BM25_FIELD_WEIGHTS["collection"]
+
         # Ingredients field
         if self._bm25_ingredients:
             ing_scores = self._bm25_ingredients.get_scores(query_tokens)
@@ -353,6 +368,8 @@ class ChromaStore:
             doc_weighted = 0.0
             if self._bm25_name:
                 doc_weighted += self._bm25_name.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["name"]
+            if self._bm25_collection:
+                doc_weighted += self._bm25_collection.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["collection"]
             if self._bm25_ingredients:
                 doc_weighted += self._bm25_ingredients.get_scores(query_tokens)[i] * self.BM25_FIELD_WEIGHTS["ingredients"]
             if self._bm25_color:
@@ -372,6 +389,7 @@ class ChromaStore:
             "field_matches": field_matches,
             "all_matched_terms": list(set(
                 field_matches.get("name", []) +
+                field_matches.get("collection", []) +
                 field_matches.get("ingredients", []) +
                 field_matches.get("color", []) +
                 field_matches.get("content", [])
@@ -467,16 +485,19 @@ class ChromaStore:
 
                 # Field-level match summary
                 name_matches = set()
+                collection_matches = set()
                 ingredient_matches = set()
                 color_matches = set()
                 content_matches = set()
                 for c in all_candidates:
                     name_matches.update(c["field_matches"].get("name", []))
+                    collection_matches.update(c["field_matches"].get("collection", []))
                     ingredient_matches.update(c["field_matches"].get("ingredients", []))
                     color_matches.update(c["field_matches"].get("color", []))
                     content_matches.update(c["field_matches"].get("content", []))
 
                 span.set_attribute("bm25.name_matches", ", ".join(name_matches) if name_matches else "none")
+                span.set_attribute("bm25.collection_matches", ", ".join(collection_matches) if collection_matches else "none")
                 span.set_attribute("bm25.ingredient_matches", ", ".join(ingredient_matches) if ingredient_matches else "none")
                 span.set_attribute("bm25.color_matches", ", ".join(color_matches) if color_matches else "none")
                 span.set_attribute("bm25.content_matches", ", ".join(content_matches) if content_matches else "none")

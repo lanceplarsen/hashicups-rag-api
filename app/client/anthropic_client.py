@@ -1,8 +1,6 @@
 import anthropic
-import asyncio
-import contextvars
 import time
-from typing import List, Optional
+from typing import List
 
 from app.models import Message, TokenUsage
 from app.config import settings
@@ -57,6 +55,26 @@ Latest message: "{message}"
 
 Rewritten search query (just the query, nothing else):"""
 
+MENTION_COFFEES_TOOL = {
+    "name": "mention_coffees",
+    "description": "Call this with the exact product names from the catalog that you mentioned or recommended in your reply. If you did not mention any specific product, omit this call.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "coffee_names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Product names from the catalog that you mentioned or recommended.",
+            }
+        },
+        "required": ["coffee_names"],
+    },
+}
+
+MENTION_COFFEES_SYSTEM_ADDITION = """
+
+When you mention or recommend specific coffees from the catalog above, call the mention_coffees tool with the **exact** product names as they appear in the catalog (e.g. ["Sumatra", "Vaulted Latte"]). If you don't mention any specific product, you may omit the tool call."""
+
 
 class AnthropicClient:
     """Claude API client with tracing and metrics."""
@@ -64,7 +82,7 @@ class AnthropicClient:
     INTENT_MODEL = "claude-3-haiku-20240307"
 
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.model = settings.anthropic_model
         self.max_tokens = settings.anthropic_max_tokens
 
@@ -75,19 +93,13 @@ class AnthropicClient:
             span.set_attribute("message", message)
 
             try:
-                ctx = contextvars.copy_context()
-                def _do_classify():
-                    return self.client.messages.create(
-                        model=self.INTENT_MODEL,
-                        max_tokens=20,
-                        messages=[{
-                            "role": "user",
-                            "content": INTENT_CLASSIFICATION_PROMPT.format(message=message)
-                        }]
-                    )
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: ctx.run(_do_classify)
+                response = await self.client.messages.create(
+                    model=self.INTENT_MODEL,
+                    max_tokens=20,
+                    messages=[{
+                        "role": "user",
+                        "content": INTENT_CLASSIFICATION_PROMPT.format(message=message)
+                    }]
                 )
 
                 intent = response.content[0].text.strip().lower()
@@ -116,22 +128,16 @@ class AnthropicClient:
                     for msg in conversation_history[-6:]  # Last 3 turns max
                 ])
 
-                ctx = contextvars.copy_context()
-                def _do_rewrite():
-                    return self.client.messages.create(
-                        model=self.INTENT_MODEL,
-                        max_tokens=100,
-                        messages=[{
-                            "role": "user",
-                            "content": QUERY_REWRITE_PROMPT.format(
-                                history=history_str,
-                                message=message
-                            )
-                        }]
-                    )
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: ctx.run(_do_rewrite)
+                response = await self.client.messages.create(
+                    model=self.INTENT_MODEL,
+                    max_tokens=100,
+                    messages=[{
+                        "role": "user",
+                        "content": QUERY_REWRITE_PROMPT.format(
+                            history=history_str,
+                            message=message
+                        )
+                    }]
                 )
 
                 rewritten = response.content[0].text.strip()
@@ -141,6 +147,50 @@ class AnthropicClient:
             except Exception as e:
                 span.record_exception(e)
                 return message  # fallback to original on error
+
+    async def _call_claude(
+        self,
+        system: str,
+        messages: List[Message],
+        current_message: str,
+        start_time: float,
+        span,
+        tools: list = None,
+    ):
+        """Shared scaffolding: build messages, call the API, record metrics, return the raw response."""
+        anthropic_messages = [
+            {"role": msg.role, "content": msg.content}
+            for msg in messages
+        ]
+        anthropic_messages.append({"role": "user", "content": current_message})
+
+        kwargs = dict(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=system,
+            messages=anthropic_messages,
+        )
+        if tools:
+            kwargs["tools"] = tools
+
+        response = await self.client.messages.create(**kwargs)
+
+        duration = time.time() - start_time
+        token_usage = TokenUsage(
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+
+        llm_requests_total.labels(model=self.model, status="success").inc()
+        llm_tokens_total.labels(model=self.model, type="input").inc(token_usage.input_tokens)
+        llm_tokens_total.labels(model=self.model, type="output").inc(token_usage.output_tokens)
+        llm_request_duration_seconds.observe(duration)
+        span.set_attribute("llm.input_tokens", token_usage.input_tokens)
+        span.set_attribute("llm.output_tokens", token_usage.output_tokens)
+        span.set_attribute("llm.duration_seconds", duration)
+        anthropic_api_health.set(1)
+
+        return response, token_usage, duration
 
     async def generate(
         self,
@@ -152,86 +202,75 @@ class AnthropicClient:
         with tracer.start_as_current_span("anthropic.generate") as span:
             span.set_attribute("llm.model", self.model)
             span.set_attribute("llm.context_length", len(context))
-
             start_time = time.time()
 
             try:
-                # Build the full system prompt with context
                 full_system = f"{SYSTEM_PROMPT}\n\n## Available Coffee Catalog:\n\n{context}"
-
-                # Convert conversation history to Anthropic format
-                anthropic_messages = []
-                for msg in messages:
-                    anthropic_messages.append({
-                        "role": msg.role,
-                        "content": msg.content
-                    })
-
-                # Add the current user message
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": current_message
-                })
-
-                # Call Claude API (synchronous client, run in thread pool).
-                # Propagate trace context into the executor so the outbound HTTP span
-                # is linked to this trace instead of starting a new one.
-                ctx = contextvars.copy_context()
-                def _do_create():
-                    return self.client.messages.create(
-                        model=self.model,
-                        max_tokens=self.max_tokens,
-                        system=full_system,
-                        messages=anthropic_messages
-                    )
-                response = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: ctx.run(_do_create)
+                response, token_usage, _ = await self._call_claude(
+                    system=full_system,
+                    messages=messages,
+                    current_message=current_message,
+                    start_time=start_time,
+                    span=span,
                 )
-
-                duration = time.time() - start_time
-
-                # Extract response text
-                response_text = response.content[0].text
-
-                # Extract token usage
-                token_usage = TokenUsage(
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens
-                )
-
-                # Record metrics
-                llm_requests_total.labels(
-                    model=self.model,
-                    status="success"
-                ).inc()
-
-                llm_tokens_total.labels(
-                    model=self.model,
-                    type="input"
-                ).inc(token_usage.input_tokens)
-
-                llm_tokens_total.labels(
-                    model=self.model,
-                    type="output"
-                ).inc(token_usage.output_tokens)
-
-                llm_request_duration_seconds.observe(duration)
-
-                span.set_attribute("llm.input_tokens", token_usage.input_tokens)
-                span.set_attribute("llm.output_tokens", token_usage.output_tokens)
-                span.set_attribute("llm.duration_seconds", duration)
-
-                anthropic_api_health.set(1)
-
+                response_text = response.content[0].text if response.content else ""
                 return response_text, token_usage
 
             except Exception as e:
                 duration = time.time() - start_time
-                llm_requests_total.labels(
-                    model=self.model,
-                    status="error"
-                ).inc()
+                llm_requests_total.labels(model=self.model, status="error").inc()
+                llm_request_duration_seconds.observe(duration)
+                anthropic_api_health.set(0)
+                span.record_exception(e)
+                raise
+
+    async def generate_with_mentioned_coffees(
+        self,
+        context: str,
+        messages: List[Message],
+        current_message: str,
+    ) -> tuple[str, TokenUsage, List[str]]:
+        """Generate a response with tool use; return prose, token usage, and coffee names Claude mentioned."""
+        with tracer.start_as_current_span("anthropic.generate_with_mentioned_coffees") as span:
+            span.set_attribute("llm.model", self.model)
+            span.set_attribute("llm.context_length", len(context))
+            start_time = time.time()
+
+            try:
+                full_system = (
+                    f"{SYSTEM_PROMPT}\n\n## Available Coffee Catalog:\n\n{context}"
+                    f"{MENTION_COFFEES_SYSTEM_ADDITION}"
+                )
+                response, token_usage, _ = await self._call_claude(
+                    system=full_system,
+                    messages=messages,
+                    current_message=current_message,
+                    start_time=start_time,
+                    span=span,
+                    tools=[MENTION_COFFEES_TOOL],
+                )
+
+                response_text_parts = []
+                mentioned_names: List[str] = []
+
+                for block in response.content:
+                    if block.type == "text":
+                        if block.text:
+                            response_text_parts.append(block.text)
+                    elif block.type == "tool_use" and block.name == "mention_coffees":
+                        mentioned_names = block.input.get("coffee_names", []) or []
+
+                response_text = "\n".join(response_text_parts) if response_text_parts else ""
+
+                span.set_attribute("mentioned_coffees.count", len(mentioned_names))
+                if mentioned_names:
+                    span.set_attribute("mentioned_coffees.names", ",".join(mentioned_names))
+
+                return response_text, token_usage, mentioned_names
+
+            except Exception as e:
+                duration = time.time() - start_time
+                llm_requests_total.labels(model=self.model, status="error").inc()
                 llm_request_duration_seconds.observe(duration)
                 anthropic_api_health.set(0)
                 span.record_exception(e)

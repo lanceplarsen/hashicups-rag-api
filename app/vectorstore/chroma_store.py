@@ -42,7 +42,7 @@ class ChromaStore:
         self._bm25_content: Optional[BM25Okapi] = None
         self._bm25_doc_ids: List[str] = []  # Map BM25 index position to doc ID
 
-        # Store tokenized corpora for debugging/tracing
+        # Store tokenized corpora for BM25 and tracing
         self._corpus_name: List[List[str]] = []
         self._corpus_ingredients: List[List[str]] = []
         self._corpus_color: List[List[str]] = []
@@ -587,62 +587,3 @@ class ChromaStore:
 
             span.set_attribute("coffees.count", len(coffees))
             return coffees
-
-    def search_debug(
-        self,
-        query: str,
-        top_k: int = None,
-        threshold: float = None,
-        semantic_weight: float = 0.6,
-        keyword_weight: float = 0.4
-    ) -> dict:
-        """Run a hybrid search and return detailed results for debugging.
-        Shows semantic scores, keyword scores, and combined hybrid scores."""
-        top_k = top_k or settings.retrieval_top_k
-        threshold = threshold or settings.retrieval_threshold
-        document_count = self.get_document_count()
-
-        query_embedding = self._embedding_model.encode([query]).tolist()
-        results = self._collection.query(
-            query_embeddings=query_embedding,
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
-
-        raw_results = []
-        if results["ids"] and results["ids"][0]:
-            for i, doc_id in enumerate(results["ids"][0]):
-                metadata = results["metadatas"][0][i]
-                distance = results["distances"][0][i]
-
-                semantic_score = 1 - distance
-                bm25_normalized, field_details, bm25_raw = self._bm25_score(query, doc_id)
-                hybrid_score = (semantic_score * semantic_weight) + (bm25_normalized * keyword_weight)
-
-                raw_results.append({
-                    "id": doc_id,
-                    "name": metadata.get("name", ""),
-                    "semantic_score": float(round(semantic_score, 4)),
-                    "bm25_score": float(round(bm25_normalized, 4)),
-                    "bm25_raw": float(round(bm25_raw, 4)),
-                    "field_scores": field_details.get("field_scores", {}),
-                    "field_matches": field_details.get("field_matches", {}),
-                    "hybrid_score": float(round(hybrid_score, 4)),
-                    "passed_threshold": bool(hybrid_score >= threshold),
-                })
-
-        # Sort by hybrid score
-        raw_results.sort(key=lambda x: x["hybrid_score"], reverse=True)
-
-        return {
-            "document_count": document_count,
-            "query": query,
-            "query_tokens": self._tokenize(query),
-            "top_k": top_k,
-            "threshold": threshold,
-            "semantic_weight": semantic_weight,
-            "keyword_weight": keyword_weight,
-            "bm25_field_weights": self.BM25_FIELD_WEIGHTS,
-            "raw_results": raw_results,
-            "passed_count": sum(1 for r in raw_results if r["passed_threshold"]),
-        }

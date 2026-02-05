@@ -104,6 +104,7 @@ class RAGPipeline:
 
             # Step 2: Route based on intent
             retrieved = []
+            all_coffees = []
             search_query = message
 
             if intent == "coffee_search":
@@ -142,11 +143,27 @@ Do NOT invent details about products. Only reference products by name to redirec
                 context = self._build_catalog_context(all_coffees)
 
             # Step 4: Generate response with Claude
-            response_text, token_usage = await self.anthropic_client.generate(
-                context=context,
-                messages=conversation_history,
-                current_message=message
-            )
+            coffees: List[RetrievedCoffee] = []
+            if intent == "coffee_search" and retrieved:
+                response_text, token_usage, mentioned_names = await self.anthropic_client.generate_with_mentioned_coffees(
+                    context=context,
+                    messages=conversation_history,
+                    current_message=message
+                )
+                coffees = self._filter_retrieved_by_mentioned(retrieved, mentioned_names)
+            elif intent == "off_topic":
+                response_text, token_usage = await self.anthropic_client.generate(
+                    context=context,
+                    messages=conversation_history,
+                    current_message=message
+                )
+            else:
+                response_text, token_usage, mentioned_names = await self.anthropic_client.generate_with_mentioned_coffees(
+                    context=context,
+                    messages=conversation_history,
+                    current_message=message
+                )
+                coffees = self._resolve_mentioned_coffees(all_coffees, mentioned_names)
 
             # Calculate latency
             latency_ms = (time.time() - start_time) * 1000
@@ -155,19 +172,55 @@ Do NOT invent details about products. Only reference products by name to redirec
             span.set_attribute("response.length", len(response_text))
             span.set_attribute("latency_ms", latency_ms)
 
-            # Build response - include retrieved coffees for coffee_search,
-            # or top suggestions for conversational
-            retrieved_coffees = [
-                RetrievedCoffee(coffee=coffee, similarity_score=round(score, 4))
-                for coffee, score in retrieved
-            ]
-
             return ChatResponse(
                 response=response_text,
-                retrieved_coffees=retrieved_coffees,
+                retrieved_coffees=coffees,
                 token_usage=token_usage,
                 latency_ms=round(latency_ms, 2)
             )
+
+    def _filter_retrieved_by_mentioned(
+        self, retrieved: list, mentioned_names: List[str]
+    ) -> List[RetrievedCoffee]:
+        """Filter retrieved (coffee, score) to only mentioned names; preserve order and original scores."""
+        if not retrieved or not mentioned_names:
+            return []
+        name_to_pair = {
+            coffee.name.strip().lower(): (coffee, score)
+            for coffee, score in retrieved
+        }
+        seen_ids = set()
+        result = []
+        for name in mentioned_names:
+            key = (name or "").strip().lower()
+            if not key:
+                continue
+            pair = name_to_pair.get(key)
+            if pair:
+                coffee, score = pair
+                if coffee.id not in seen_ids:
+                    seen_ids.add(coffee.id)
+                    result.append(RetrievedCoffee(coffee=coffee, similarity_score=round(score, 4)))
+        return result
+
+    def _resolve_mentioned_coffees(
+        self, catalog: list, mentioned_names: List[str]
+    ) -> List[RetrievedCoffee]:
+        """Map mentioned product names to catalog coffees; preserve order, dedupe by id."""
+        if not catalog or not mentioned_names:
+            return []
+        name_to_coffee = {c.name.strip().lower(): c for c in catalog}
+        seen_ids = set()
+        result = []
+        for name in mentioned_names:
+            key = (name or "").strip().lower()
+            if not key:
+                continue
+            coffee = name_to_coffee.get(key)
+            if coffee and coffee.id not in seen_ids:
+                seen_ids.add(coffee.id)
+                result.append(RetrievedCoffee(coffee=coffee, similarity_score=1.0))
+        return result
 
     def _format_ingredient(self, ing: Ingredient) -> str:
         """Format an ingredient with quantity and unit if available."""

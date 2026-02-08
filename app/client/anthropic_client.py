@@ -80,22 +80,21 @@ When you mention or recommend specific coffees from the catalog above, call the 
 class AnthropicClient:
     """Claude API client with tracing and metrics."""
 
-    INTENT_MODEL = "claude-3-haiku-20240307"
-
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self.model = settings.anthropic_model
+        self.model = settings.anthropic_reasoning_model
+        self.intent_model = settings.anthropic_intent_model
         self.max_tokens = settings.anthropic_max_tokens
 
     async def classify_intent(self, message: str) -> str:
         """Classify user message intent using Haiku for fast/cheap classification."""
         with tracer.start_as_current_span("anthropic.classify_intent") as span:
-            span.set_attribute("llm.model", self.INTENT_MODEL)
+            span.set_attribute("llm.model", self.intent_model)
             span.set_attribute("message", message)
 
             try:
                 response = await self.client.messages.create(
-                    model=self.INTENT_MODEL,
+                    model=self.intent_model,
                     max_tokens=20,
                     messages=[{
                         "role": "user",
@@ -119,7 +118,7 @@ class AnthropicClient:
     async def rewrite_query(self, message: str, conversation_history: List[Message]) -> str:
         """Rewrite a follow-up message as a standalone search query using conversation context."""
         with tracer.start_as_current_span("anthropic.rewrite_query") as span:
-            span.set_attribute("llm.model", self.INTENT_MODEL)
+            span.set_attribute("llm.model", self.intent_model)
             span.set_attribute("original_message", message)
 
             try:
@@ -130,7 +129,7 @@ class AnthropicClient:
                 ])
 
                 response = await self.client.messages.create(
-                    model=self.INTENT_MODEL,
+                    model=self.intent_model,
                     max_tokens=100,
                     messages=[{
                         "role": "user",
@@ -280,7 +279,7 @@ class AnthropicClient:
     async def generate_coffee_description(self, name: str, teaser: str, description: str, ingredients: str) -> str:
         """Generate a natural coffee-domain description for search enrichment using Haiku."""
         with tracer.start_as_current_span("anthropic.generate_coffee_description") as span:
-            span.set_attribute("llm.model", self.INTENT_MODEL)
+            span.set_attribute("llm.model", self.intent_model)
             span.set_attribute("coffee.name", name)
 
             prompt = f"""You are helping build a search index for a coffee shop. Given a coffee product, write 2-3 sentences describing it as a real coffee drink.
@@ -304,7 +303,7 @@ Write only the description, nothing else. Keep it to 2-3 sentences."""
 
             try:
                 response = await self.client.messages.create(
-                    model=self.INTENT_MODEL,
+                    model=self.intent_model,
                     max_tokens=200,
                     messages=[{"role": "user", "content": prompt}]
                 )

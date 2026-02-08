@@ -7,7 +7,7 @@ PIP := $(VENV)/bin/pip
 
 # Docker
 IMAGE_NAME := 767397794709.dkr.ecr.us-west-2.amazonaws.com/hashicups/rag-api
-IMAGE_TAG := v0.0.8
+IMAGE_TAG := v0.0.9
 
 # Development
 install: $(VENV)

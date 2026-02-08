@@ -38,7 +38,8 @@ class Settings(BaseSettings):
 
     # Anthropic settings
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-4-20250514"
+    anthropic_reasoning_model: str = "claude-sonnet-4-5"
+    anthropic_intent_model: str = "claude-haiku-4-5"
     anthropic_max_tokens: int = 1024
 
     @field_validator("anthropic_api_key", mode="after")
